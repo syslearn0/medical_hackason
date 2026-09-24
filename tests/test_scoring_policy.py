@@ -42,6 +42,27 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(result["scores"]["リスク"]["score"], 3)
         self.assertEqual(audit["リスク"]["source"], "neutral_default")
 
+    def test_risk_combinations(self):
+        cases = [
+            ("食事は少量のみ。注意点として、食事低下、高リスクがみられる。", 4),
+            ("注意点として、活動低下、高リスクがみられる。服薬拒否があり確認が必要。", 5),
+            ("入浴介助あり。経過観察が必要。", 3),
+            ("日常動作に介助が必要な場面が多い。", 3),
+            ("日常動作に介助が必要な場面が多い。状態は安定。", 2),
+            ("入浴介助あり。排泄は自立。", 1),
+            ("声かけのみで入浴できた。排泄は自立。", 0),
+        ]
+        for record, expected in cases:
+            result, audit = scoring_policy.finalize(self.result(), record)
+            self.assertEqual(result["scores"]["リスク"]["score"], expected, record)
+            self.assertEqual(audit["リスク"]["source"], "exact_rule")
+            predict.validate_result(result, record)
+
+    def test_risk_not_from_warning_words_alone(self):
+        # 「注意」の語だけでは高リスクにしない。列挙がなければ組み合わせで判断する
+        for record in ["傾眠や軽度の混乱に注意。", "高リスクではない。", "注意点として、高リスクがみられない。"]:
+            self.assertFalse(scoring_policy.matching_rules(record)["リスク"], record)
+
     def test_api_failure_still_has_numbers_and_review(self):
         result, audit = scoring_policy.finalize(None, "食事は少量のみ。", failure="timeout")
         predict.validate_result(result, "食事は少量のみ。")

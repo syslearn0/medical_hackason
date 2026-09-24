@@ -8,7 +8,7 @@ import hashlib
 import re
 from pathlib import Path
 
-VERSION = "numeric-with-review-v2"
+VERSION = "numeric-with-review-v3-risk"
 
 # Whole-sentence matches avoid treating negations, plans and past events as facts.
 # These examples are provisional, not an official clinical scoring standard.
@@ -55,9 +55,42 @@ RULES = {
         (r"(?:日常動作に介助が必要な場面が多い|複数場面で介助を要した)", 4),
         (r"(?:拒否があり対応に時間を要した|ふらつきがあり常時見守りを要した)", 5),
     ],
-    # Risk boundaries are not fixed by the supplied rubric; do not invent a rule.
+    # Risk is a combination of statements, so it is decided by risk_rule() below.
     "リスク": [],
 }
+
+# リスクは単文では決まらないため、公開例の傾向を組み合わせで表す（暫定。境界は未確定）
+NOTES = r"注意点として、(.+)がみられる"
+MEDICATION = r"服薬拒否があり確認が必要"
+WATCH = r"経過観察が必要"
+STABLE = r"(?:状態は安定|経過は概ね安定|軽度の疲労感はあるが大きな問題なし)"
+
+
+def _matches(sentences, name, scores):
+    return [s for pattern, score in RULES[name] if score in scores for s in sentences if re.fullmatch(pattern, s)]
+
+
+def risk_rule(sentences):
+    """高リスクの列挙=4（服薬拒否で5）、経過観察・注意点=3、介助が多い=3（安定の記載で2）、介助あり=1、自立=0。"""
+    listed = [s for s in sentences if re.fullmatch(NOTES, s)]
+    notes = {n for s in listed for n in re.fullmatch(NOTES, s).group(1).split("、")}
+    medication = [s for s in sentences if re.fullmatch(MEDICATION, s)]
+    watch = [s for s in sentences if re.fullmatch(WATCH, s)]
+    many = _matches(sentences, "介助負担", {4})
+    stable = [s for s in sentences if re.fullmatch(STABLE, s)]
+    assisted = _matches(sentences, "入浴", {2, 3}) + _matches(sentences, "排泄自立度", {2, 3})
+    independent = _matches(sentences, "入浴", {5}) + _matches(sentences, "排泄自立度", {4, 5})
+    if "高リスク" in notes:
+        return 4 + bool(medication), listed + medication
+    if watch or listed:
+        return 3, watch + listed
+    if many:
+        return (2, many + stable) if stable else (3, many)
+    if assisted:
+        return 1, assisted
+    if independent:
+        return 0, independent
+    return None, []  # 根拠なし: モデルの推定または既定値に任せる
 
 
 def fingerprint():
@@ -65,12 +98,17 @@ def fingerprint():
 
 
 def matching_rules(record):
-    sentences = [s.strip() for s in re.split(r"[。\n]", record) if s.strip()]
-    return {
+    sentences = list(dict.fromkeys(s.strip() for s in re.split(r"[。\n]", record) if s.strip()))
+    matches = {
         name: [{"score": score, "evidence": s} for pattern, score in patterns
-               for s in dict.fromkeys(sentences) if re.fullmatch(pattern, s)]
+               for s in sentences if re.fullmatch(pattern, s)]
         for name, patterns in RULES.items()
     }
+    score, evidence = risk_rule(sentences)
+    if score is not None:
+        # 組み合わせで1つの点数なので、根拠の文すべてを同じ点数の候補として並べる
+        matches["リスク"] = [{"score": score, "evidence": s} for s in evidence]
+    return matches
 
 
 def finalize(raw_result, record, failure=None):
