@@ -1,0 +1,5 @@
+__pycache__/
+data/
+results/
+sample_3users/
+*.log
