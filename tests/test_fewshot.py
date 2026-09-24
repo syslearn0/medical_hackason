@@ -42,7 +42,7 @@ class FewShotTests(unittest.TestCase):
 
     def test_past_scores_stable_when_new_day_added(self):
         """翌日の記録が入力に追加されても、過去日は再採点されずキャッシュのまま。"""
-        valid = {"scores": {k: {"score": None, "evidence": [], "needs_review": True} for k in predict.FIELDS}, "review_note": "情報不足"}
+        valid = {"scores": {k: {"score": 3, "evidence": [], "needs_review": True} for k in predict.FIELDS}, "review_note": "情報不足の暫定値"}
         response = {"done": True, "message": {"content": json.dumps(valid)}}
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

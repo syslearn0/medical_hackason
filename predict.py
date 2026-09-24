@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+import scoring_policy
 
 ROOT = Path(__file__).resolve().parent
 URL = "http://127.0.0.1:11434"
@@ -26,7 +27,7 @@ SCHEMA = {
                     "type": "object", "additionalProperties": False,
                     "required": ["score", "evidence", "needs_review"],
                     "properties": {
-                        "score": {"enum": [None, *range(1 if i < 6 else 0, 6)]},
+                        "score": {"type": "integer", "enum": list(range(1 if i < 6 else 0, 6))},
                         "evidence": {"type": "array", "items": {"type": "string"}},
                         "needs_review": {"type": "boolean"},
                     },
@@ -115,19 +116,29 @@ def validate_result(result, record):
         if not isinstance(item, dict) or set(item) != {"score", "evidence", "needs_review"}:
             raise ValueError(f"{name}: 出力形式が不正です。")
         score = item["score"]
-        if score is not None and (type(score) is not int or not (1 if i < 6 else 0) <= score <= 5):
+        if type(score) is not int or not (1 if i < 6 else 0) <= score <= 5:
             raise ValueError(f"{name}: 点数が暫定範囲外です。")
         if type(item["needs_review"]) is not bool:
             raise ValueError(f"{name}: needs_reviewはbooleanにしてください。")
         evidence = item["evidence"]
         if not isinstance(evidence, list) or any(not isinstance(s, str) or not s.strip() or s not in record for s in evidence):
             raise ValueError(f"{name}: 根拠は記録中に存在する文字列をそのまま引用してください。")
-        if score is None and not item["needs_review"]:
-            raise ValueError(f"{name}: nullには確認フラグが必要です。")
-        if score is not None and not evidence:
-            raise ValueError(f"{name}: 点数には根拠が必要です。")
+        if not evidence and not item["needs_review"]:
+            raise ValueError(f"{name}: 根拠がない推定値には確認フラグが必要です。")
     if any(v["needs_review"] for v in scores.values()) and not result["review_note"].strip():
         raise ValueError("確認事項の理由をreview_noteに記載してください。")
+    return result
+
+
+def normalize_review_note(result):
+    """A missing explanation is a review issue, not a reason to discard scores."""
+    if (isinstance(result, dict) and result.get("review_note") == ""
+            and isinstance(result.get("scores"), dict)):
+        flagged = [k for k, v in result["scores"].items()
+                   if isinstance(v, dict) and v.get("needs_review") is True]
+        if flagged:
+            result = dict(result)
+            result["review_note"] = "モデルが要確認と判定しましたが理由を出力しませんでした: " + "、".join(flagged)
     return result
 
 
@@ -146,25 +157,29 @@ def save_csv(path, columns, rows):
     temp.replace(path)
 
 
-def export_results(out, completed, errors):
-    daily, review = [], []
+def export_results(out, completed, errors, audits=None):
+    daily, review, flags = [], [], []
+    audits = audits or {}
     for row, result in completed:
+        validate_result(result, row["record"])
         daily.append({"user_id": row["user_id"], "date": row["date"], **{k: result["scores"][k]["score"] for k in FIELDS}})
+        flags.append({"user_id": row["user_id"], "date": row["date"], **{k: result["scores"][k]["needs_review"] for k in FIELDS}})
         for k, value in result["scores"].items():
             if value["needs_review"]:
                 review.append({"user_id": row["user_id"], "date": row["date"], "項目": k,
                                "推定値": value["score"], "根拠": " / ".join(value["evidence"]), "確認理由": result["review_note"]})
     save_csv(out / "daily_scores.csv", ["user_id", "date", *FIELDS], daily)
+    save_csv(out / "review_flags.csv", ["user_id", "date", *FIELDS], flags)
     save_csv(out / "review.csv", ["user_id", "date", "項目", "推定値", "根拠", "確認理由"], review)
     save_csv(out / "errors.csv", ["user_id", "date", "error"], errors)
-    save_json(out / "details.json", [{**row, **result} for row, result in completed])
+    save_json(out / "details.json", [{**row, **result, "audit": audits.get((row["user_id"], row["date"]), {})} for row, result in completed])
     return len(review)
 
 
 def main():
     p = argparse.ArgumentParser(description="ローカルQwenによる日次採点（暫定基準・提出CSVではありません）")
     p.add_argument("--input", type=Path, default=ROOT / "data/input/care_hackathon_records_3users_14days.csv")
-    p.add_argument("--output", type=Path, default=ROOT / "results/sample")
+    p.add_argument("--output", type=Path, default=ROOT / "results/sample_v2")
     p.add_argument("--prompt", type=Path, default=ROOT / "prompts/scoring.txt")
     p.add_argument("--model", default="qwen3.5:35b")
     p.add_argument("--limit", type=int, help="先頭N件だけ動作確認")
@@ -189,13 +204,20 @@ def main():
     if not prompt.strip():
         raise ValueError("プロンプトが空です。")
     model = get_model(args.model)
+    existing_run = args.output / "run.json"
+    if existing_run.exists():
+        previous = json.loads(existing_run.read_text(encoding="utf-8"))
+        if previous.get("scoring_policy_version") != scoring_policy.VERSION:
+            raise ValueError("旧版の結果を保護しました。--outputで新しいフォルダを指定してください。")
     args.output.mkdir(parents=True, exist_ok=True)
     cache = args.output / "cache"
     cache.mkdir(exist_ok=True)
     completed, errors, cache_hits = [], [], 0
+    audits, fallback_records = {}, 0
     started = time.monotonic()
     interrupted = False
-    config = {"model": args.model, "digest": model.get("digest"), "prompt": prompt, "schema": SCHEMA, "options": OPTIONS, "think": False}
+    config = {"model": args.model, "digest": model.get("digest"), "prompt": prompt, "schema": SCHEMA, "options": OPTIONS, "think": False,
+              "policy_digest": scoring_policy.fingerprint()}
     system = prompt + "\n\n出力JSON Schema:\n" + json.dumps(SCHEMA, ensure_ascii=False)
     try:
         for index, row in enumerate(records, 1):
@@ -206,10 +228,11 @@ def main():
                 try:
                     cached = json.loads(cache_file.read_text(encoding="utf-8"))
                     result = validate_result(cached["result"], row["record"])
+                    audits[(row["user_id"], row["date"])] = cached["audit"]
                     completed.append((row, result))
                     cache_hits += 1
                     print("  保存済みの結果を再利用", flush=True)
-                    export_results(args.output, completed, errors)
+                    export_results(args.output, completed, errors, audits)
                     continue
                 except (ValueError, KeyError, TypeError):
                     print("  キャッシュを再作成します", flush=True)
@@ -227,8 +250,11 @@ def main():
                     }, timeout=args.timeout)
                     if response.get("done") is not True or response.get("done_reason") == "length":
                         raise ValueError("出力が完了していません。生成上限やプロンプトを確認してください。")
-                    result = validate_result(json.loads(response["message"]["content"]), row["record"])
-                    save_json(cache_file, {"result": result, "model": args.model, "digest": model.get("digest"),
+                    raw_result = validate_result(normalize_review_note(json.loads(response["message"]["content"])), row["record"])
+                    result, audit = scoring_policy.finalize(raw_result, row["record"])
+                    validate_result(result, row["record"])
+                    audits[(row["user_id"], row["date"])] = audit
+                    save_json(cache_file, {"result": result, "raw_result": raw_result, "audit": audit, "model": args.model, "digest": model.get("digest"),
                                           "total_duration_ns": response.get("total_duration"), "eval_count": response.get("eval_count")})
                     completed.append((row, result))
                     print("  保存しました", flush=True)
@@ -238,18 +264,26 @@ def main():
                     print(f"  試行{attempt + 1}: {last_error}", flush=True)
             else:
                 errors.append({"user_id": row["user_id"], "date": row["date"], "error": last_error})
-            export_results(args.output, completed, errors)
+                result, audit = scoring_policy.finalize(None, row["record"], failure=last_error)
+                validate_result(result, row["record"])
+                completed.append((row, result))
+                audits[(row["user_id"], row["date"])] = audit
+                fallback_records += 1
+                print("  暫定値を保存しました。エラーは未解決なので再実行が必要です。", flush=True)
+            export_results(args.output, completed, errors, audits)
     except KeyboardInterrupt:
         interrupted = True
         print("\n中断しました。完了済みの結果は保存されます。同じコマンドで再開できます。")
-    review_count = export_results(args.output, completed, errors)
+    review_count = export_results(args.output, completed, errors, audits)
     elapsed = round(time.monotonic() - started, 2)
     save_json(args.output / "run.json", {
         "input": str(args.input.resolve()), "model": args.model, "model_digest": model.get("digest"),
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(), "options": OPTIONS, "think": False,
         "requested_records": len(records), "completed_records": len(completed), "failed_records": len(errors),
         "cache_hits": cache_hits, "review_items": review_count, "interrupted": interrupted,
-        "elapsed_seconds": elapsed, "output_kind": "daily_provisional_not_submission",
+        "fallback_records": fallback_records, "scoring_policy_version": scoring_policy.VERSION,
+        "scoring_policy_digest": config["policy_digest"],
+        "elapsed_seconds": elapsed, "output_kind": "daily_numeric_with_review",
     })
     print(f"完了 {len(completed)}/{len(records)}件、エラー {len(errors)}件、要確認 {review_count}項目、{elapsed}秒\n保存先: {args.output.resolve()}")
     return 130 if interrupted else (1 if errors else 0)
