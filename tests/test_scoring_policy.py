@@ -58,6 +58,27 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(audit["リスク"]["source"], "exact_rule")
             predict.validate_result(result, record)
 
+    def test_burden_combinations(self):
+        cases = [
+            ("入浴介助あり。トイレ誘導後は見守りのみ。入浴または排泄で介助が必要。", 4),
+            ("入浴介助あり。トイレ誘導後は見守りのみ。", 3),
+            ("体調を考慮し部分清拭とした。排泄は見守りで可能。", 3),
+            ("入浴は自立して実施。排泄は自立。", 0),
+            ("日常動作に介助が必要な場面が多い。排泄は自立。", 4),  # 単文の対応表が組み合わせより優先
+        ]
+        for record, expected in cases:
+            result, audit = scoring_policy.finalize(self.result(), record)
+            self.assertEqual(result["scores"]["介助負担"]["score"], expected, record)
+            self.assertEqual(audit["介助負担"]["source"], "exact_rule")
+            predict.validate_result(result, record)
+        # 片方しか書かれていなければ組み合わせでは決めない
+        self.assertFalse(scoring_policy.matching_rules("排泄は自立。")["介助負担"])
+
+    def test_burden_sentence_does_not_raise_risk(self):
+        # 「入浴または排泄で介助が必要」は介助負担4だが、リスクの「介助が多い」には数えない
+        result, _ = scoring_policy.finalize(self.result(), "入浴介助あり。入浴または排泄で介助が必要。")
+        self.assertEqual(result["scores"]["リスク"]["score"], 1)
+
     def test_risk_not_from_warning_words_alone(self):
         # 「注意」の語だけでは高リスクにしない。列挙がなければ組み合わせで判断する
         for record in ["傾眠や軽度の混乱に注意。", "高リスクではない。", "注意点として、高リスクがみられない。"]:

@@ -8,7 +8,7 @@ import hashlib
 import re
 from pathlib import Path
 
-VERSION = "numeric-with-review-v3-risk"
+VERSION = "numeric-with-review-v4-burden"
 
 # Whole-sentence matches avoid treating negations, plans and past events as facts.
 # These examples are provisional, not an official clinical scoring standard.
@@ -52,7 +52,7 @@ RULES = {
     ],
     "介助負担": [
         (r"(?:介助負担は少ない|見守り不要で実施できた)", 0),
-        (r"(?:日常動作に介助が必要な場面が多い|複数場面で介助を要した)", 4),
+        (r"(?:日常動作に介助が必要な場面が多い|複数場面で介助を要した|入浴または排泄で介助が必要)", 4),
         (r"(?:拒否があり対応に時間を要した|ふらつきがあり常時見守りを要した)", 5),
     ],
     # Risk is a combination of statements, so it is decided by risk_rule() below.
@@ -63,6 +63,7 @@ RULES = {
 NOTES = r"注意点として、(.+)がみられる"
 MEDICATION = r"服薬拒否があり確認が必要"
 WATCH = r"経過観察が必要"
+MANY_ASSISTS = r"(?:日常動作に介助が必要な場面が多い|複数場面で介助を要した)"
 STABLE = r"(?:状態は安定|経過は概ね安定|軽度の疲労感はあるが大きな問題なし)"
 
 
@@ -76,7 +77,7 @@ def risk_rule(sentences):
     notes = {n for s in listed for n in re.fullmatch(NOTES, s).group(1).split("、")}
     medication = [s for s in sentences if re.fullmatch(MEDICATION, s)]
     watch = [s for s in sentences if re.fullmatch(WATCH, s)]
-    many = _matches(sentences, "介助負担", {4})
+    many = [s for s in sentences if re.fullmatch(MANY_ASSISTS, s)]
     stable = [s for s in sentences if re.fullmatch(STABLE, s)]
     assisted = _matches(sentences, "入浴", {2, 3}) + _matches(sentences, "排泄自立度", {2, 3})
     independent = _matches(sentences, "入浴", {5}) + _matches(sentences, "排泄自立度", {4, 5})
@@ -93,6 +94,17 @@ def risk_rule(sentences):
     return None, []  # 根拠なし: モデルの推定または既定値に任せる
 
 
+def burden_rule(sentences):
+    """介助負担の文がない日だけ使う。入浴か排泄に介助=3（公開例: 入浴介助と排泄見守り=3）、両方自立=0。"""
+    assisted = _matches(sentences, "入浴", {2, 3}) + _matches(sentences, "排泄自立度", {2, 3})
+    bath_free, toilet_free = _matches(sentences, "入浴", {5}), _matches(sentences, "排泄自立度", {5})
+    if assisted:
+        return 3, assisted + _matches(sentences, "排泄自立度", {4})
+    if bath_free and toilet_free:
+        return 0, bath_free + toilet_free
+    return None, []
+
+
 def fingerprint():
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
@@ -104,10 +116,12 @@ def matching_rules(record):
                for s in sentences if re.fullmatch(pattern, s)]
         for name, patterns in RULES.items()
     }
-    score, evidence = risk_rule(sentences)
-    if score is not None:
-        # 組み合わせで1つの点数なので、根拠の文すべてを同じ点数の候補として並べる
-        matches["リスク"] = [{"score": score, "evidence": s} for s in evidence]
+    # 組み合わせで1つの点数なので、根拠の文すべてを同じ点数の候補として並べる
+    combos = [("リスク", risk_rule)] + ([] if matches["介助負担"] else [("介助負担", burden_rule)])
+    for name, rule in combos:
+        score, evidence = rule(sentences)
+        if score is not None:
+            matches[name] = [{"score": score, "evidence": s} for s in evidence]
     return matches
 
 
